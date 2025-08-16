@@ -147,6 +147,8 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
+import { ConnectionManager } from './connection-manager';
+import { MessageSender } from './message-sender';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
@@ -225,6 +227,17 @@ export class BaileysStartupService extends ChannelStartupService {
     this.instance.qrcode = { count: 0 };
 
     this.authStateProvider = new AuthStateProvider(this.providerFiles);
+
+    // Initialize connection management
+    this.connectionManager = new ConnectionManager({
+      instanceName: this.instanceName || 'unknown',
+      maxRetries: 3,
+      baseDelayMs: 1000,
+      maxDelayMs: 30000,
+      jitterFactor: 0.2,
+    });
+
+    this.messageSender = new MessageSender(this.instanceName || 'unknown', this.connectionManager);
   }
 
   private authStateProvider: AuthStateProvider;
@@ -232,6 +245,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+
+  // Connection management
+  private connectionManager: ConnectionManager;
+  private messageSender: MessageSender;
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -245,6 +262,10 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
     this.client?.ws?.close();
+
+    // Clear connection management state
+    this.connectionManager.resetRetryCount();
+    this.messageSender.clearPendingMessages();
 
     const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
     if (sessionExists) {
@@ -381,8 +402,19 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+
+      this.logger.warn(`Connection closed. Status code: ${statusCode}, Should reconnect: ${shouldReconnect}`);
+
+      if (shouldReconnect && !this.connectionManager.isReconnecting()) {
+        // Use connection manager for controlled reconnection with delay
+        this.logger.info(`[${this.instance.name}] Initiating controlled reconnection after connection close`);
+
+        // Don't await here to prevent blocking, let connection manager handle it
+        this.connectionManager
+          .ensureConnected(this.client, 'close', () => this.connectToWhatsapp(this.phoneNumber))
+          .catch((error) => {
+            this.logger.error(`[${this.instance.name}] Controlled reconnection failed: ${error.message}`);
+          });
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -411,8 +443,16 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+
+        // Clean shutdown
+        if (this.client) {
+          try {
+            this.client.ws?.close();
+            this.client.end(new Error('Close connection'));
+          } catch (error) {
+            this.logger.debug(`Error during connection cleanup: ${error.message}`);
+          }
+        }
 
         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
@@ -546,11 +586,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (session.VERSION) {
       version = session.VERSION.split('.');
-      log = `Baileys version env: ${version}`;
+      log = `Baileys version env: ${version} (from CONFIG_SESSION_PHONE_VERSION)`;
+      this.logger.info(`Using configured WhatsApp version: ${session.VERSION}`);
     } else {
       const baileysVersion = await fetchLatestWaWebVersion({});
       version = baileysVersion.version;
-      log = `Baileys version: ${version}`;
+      log = `Baileys version: ${version} (auto-fetched latest)`;
+      this.logger.info(`Using auto-fetched latest WhatsApp version: ${version.join('.')}`);
     }
 
     this.logger.info(log);
@@ -1970,6 +2012,127 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  /**
+   * Wrapper for sendMessage with retry logic
+   */
+  private async sendMessageWithRetry(
+    sender: string,
+    message: any,
+    mentions: any,
+    linkPreview: any,
+    quoted: any,
+    messageId?: string,
+    ephemeralExpiration?: number,
+  ): Promise<WAMessage> {
+    try {
+      // Use the message sender with retry logic
+      const content = this.prepareMessageContent(message, mentions, linkPreview);
+      const options = {
+        messageId,
+        ephemeralExpiration,
+        quoted,
+      };
+
+      return await this.messageSender.sendWithRetry(
+        this.client,
+        this.stateConnection.state,
+        () => this.connectToWhatsapp(this.phoneNumber),
+        sender,
+        content,
+        options,
+        {
+          maxRetries: 3,
+          baseDelayMs: 1000,
+          maxDelayMs: 10000,
+          idempotencyKey: `${sender}_${Date.now()}_${messageId || 'auto'}`,
+        },
+      );
+    } catch (error) {
+      this.logger.error(`Failed to send message after retries: ${error.message}`);
+
+      // Fallback to original method for backward compatibility
+      return await this.sendMessage(sender, message, mentions, linkPreview, quoted, messageId, ephemeralExpiration);
+    }
+  }
+
+  /**
+   * Prepares message content for the message sender
+   */
+  private prepareMessageContent(message: any, mentions: any, linkPreview: any): AnyMessageContent {
+    if (message['conversation']) {
+      return { text: message['conversation'], mentions, linkPreview };
+    }
+
+    if (message['reactionMessage']) {
+      return {
+        react: { text: message['reactionMessage']['text'], key: message['reactionMessage']['key'] },
+      };
+    }
+
+    // For other message types, forward as-is
+    if (!message['audio'] && !message['poll'] && !message['sticker'] && !message['conversation']) {
+      return { forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message }, mentions };
+    }
+
+    // Default: return the message as-is
+    return message;
+  }
+
+  /**
+   * Sends typing indicator with retry logic
+   */
+  private async sendTypingIndicator(sender: string, options: Options): Promise<void> {
+    this.logger.verbose(`Typing for ${options.delay}ms to ${sender}`);
+
+    try {
+      // Use message sender for presence updates with retry
+      await this.messageSender.sendPresenceWithRetry(
+        this.client,
+        this.stateConnection.state,
+        () => this.connectToWhatsapp(this.phoneNumber),
+        'composing',
+        sender,
+      );
+
+      if (options.delay > 20000) {
+        let remainingDelay = options.delay;
+        while (remainingDelay > 20000) {
+          await delay(20000);
+          await this.messageSender.sendPresenceWithRetry(
+            this.client,
+            this.stateConnection.state,
+            () => this.connectToWhatsapp(this.phoneNumber),
+            'paused',
+            sender,
+          );
+          remainingDelay -= 20000;
+        }
+        if (remainingDelay > 0) {
+          await delay(remainingDelay);
+          await this.messageSender.sendPresenceWithRetry(
+            this.client,
+            this.stateConnection.state,
+            () => this.connectToWhatsapp(this.phoneNumber),
+            'paused',
+            sender,
+          );
+        }
+      } else {
+        await delay(options.delay);
+        await this.messageSender.sendPresenceWithRetry(
+          this.client,
+          this.stateConnection.state,
+          () => this.connectToWhatsapp(this.phoneNumber),
+          'paused',
+          sender,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(`Failed to send typing indicator: ${error.message}`);
+      // Don't throw, typing is not critical
+    }
+  }
+
   private async sendMessageWithTyping<T = proto.IMessage>(
     number: string,
     message: T,
@@ -1988,38 +2151,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       if (options?.delay) {
-        this.logger.verbose(`Typing for ${options.delay}ms to ${sender}`);
-        if (options.delay > 20000) {
-          let remainingDelay = options.delay;
-          while (remainingDelay > 20000) {
-            await this.client.presenceSubscribe(sender);
-
-            await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
-
-            await delay(20000);
-
-            await this.client.sendPresenceUpdate('paused', sender);
-
-            remainingDelay -= 20000;
-          }
-          if (remainingDelay > 0) {
-            await this.client.presenceSubscribe(sender);
-
-            await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
-
-            await delay(remainingDelay);
-
-            await this.client.sendPresenceUpdate('paused', sender);
-          }
-        } else {
-          await this.client.presenceSubscribe(sender);
-
-          await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
-
-          await delay(options.delay);
-
-          await this.client.sendPresenceUpdate('paused', sender);
-        }
+        await this.sendTypingIndicator(sender, options);
       }
 
       const linkPreview = options?.linkPreview != false ? undefined : false;
@@ -2066,7 +2198,7 @@ export class BaileysStartupService extends ChannelStartupService {
           });
         }
 
-        messageSent = await this.sendMessage(
+        messageSent = await this.sendMessageWithRetry(
           sender,
           message,
           mentions,
@@ -2074,10 +2206,9 @@ export class BaileysStartupService extends ChannelStartupService {
           quoted,
           null,
           group?.ephemeralDuration,
-          // group?.participants,
         );
       } else {
-        messageSent = await this.sendMessage(sender, message, mentions, linkPreview, quoted);
+        messageSent = await this.sendMessageWithRetry(sender, message, mentions, linkPreview, quoted);
       }
 
       if (Long.isLong(messageSent?.messageTimestamp)) {
